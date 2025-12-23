@@ -1,4 +1,5 @@
 import os
+import sys
 import cv2
 import numpy as np
 import onnxruntime as ort
@@ -8,6 +9,7 @@ import torch
 import simpleaudio as sa
 import threading
 import sounddevice as sd
+from scipy.signal import resample_poly
 from insightface.app import FaceAnalysis
 from piper.voice import PiperVoice
 from enum import Enum,auto
@@ -28,6 +30,7 @@ from convdb import ConversationDB
 import time
 import importlib.resources as importlib_resources
 import ctypes
+import struct
 
 load_dotenv()
 
@@ -37,7 +40,6 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-# Bazı ortamlar için OpenCV thread sayısını kısıtla (hafif hız optimizasyonu)
 try:
     cv2.setNumThreads(1)
 except Exception:
@@ -98,16 +100,16 @@ last_score_update_time = 0
 db_check_interval = 2.0  
 last_face_db_exists = False
 last_conv_db_exists = False
-watchdog_running = True
+watchdog_running = False
 
 device = "cpu"
-compute_type = "int8_float16" if device == "cuda" else "int8"
-# Yerel kuantize (int8) faster-whisper modeli
+compute_type = "int8"
+
 WHISPER_MODEL_PATH = os.getenv(
     "WHISPER_MODEL_PATH",
-    r"C:\Users\LOKMAN\.cache\whisper\whisper-medium-ct2-int8"
+    r"./faster-whisper-medium-int8"
 )
-WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "2"))  # Raspberry Pi gibi cihazlar için düşük thread
+WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "2"))  
 WHISPER_NUM_WORKERS = int(os.getenv("WHISPER_NUM_WORKERS", "1"))
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
 WHISPER_BEST_OF = int(os.getenv("WHISPER_BEST_OF", "1"))
@@ -123,6 +125,12 @@ RATE = 22000
 temp_audio_file = "temp_recording.wav"
 # Dosya kaydetmeyi aç/kapat (debug için)
 ENABLE_DEBUG_AUDIO_SAVE = False
+HEADER_FMT = "!III"
+HEADER_SIZE = struct.calcsize(HEADER_FMT)
+EXPECTED_W = 640
+EXPECTED_H = 480
+EXPECTED_C = 3
+EXPECTED_SIZE = EXPECTED_W * EXPECTED_H * EXPECTED_C
 
 threshold = 0.65
 face_db_path = "face_db.pkl"
@@ -170,7 +178,55 @@ except Exception:
     pass
 
 voice = PiperVoice.load(MODEL_PATH)
-sample_rate = voice.config.sample_rate 
+sample_rate = voice.config.sample_rate
+
+def _parse_output_device_targets(raw_targets, devices):
+    targets = []
+    for raw in raw_targets:
+        item = raw.strip()
+        if not item:
+            continue
+        if item.isdigit():
+            targets.append(int(item))
+            continue
+        lowered = item.lower()
+        for idx, dev in enumerate(devices):
+            name = str(dev.get("name", "")).lower()
+            if lowered in name and dev.get("max_output_channels", 0) > 0:
+                targets.append(idx)
+                break
+    return targets
+
+def select_output_devices():
+    """Çıkış cihazlarını seç: env ile öncelik ver, yoksa varsayılan/ilk uygun."""
+    try:
+        devices = sd.query_devices()
+    except Exception as exc:
+        print(f"Çıkış cihazları listelenemedi: {exc}")
+        return []
+
+    raw_env = os.getenv("TTS_OUTPUT_DEVICES", "")
+    if raw_env:
+        targets = _parse_output_device_targets(raw_env.split(","), devices)
+        if targets:
+            return targets[:2]
+
+    targets = []
+    try:
+        default_dev = sd.default.device
+        default_out = default_dev[1] if isinstance(default_dev, (list, tuple)) else default_dev
+        if default_out is not None and default_out != -1:
+            targets.append(default_out)
+    except Exception as exc:
+        print(f"Varsayılan çıkış cihazı okunamadı: {exc}")
+
+    for idx, dev in enumerate(devices):
+        if dev.get("max_output_channels", 0) > 0 and idx not in targets:
+            targets.append(idx)
+        if len(targets) >= 2:
+            break
+
+    return targets
 
 
 class AsyncTTSPlayer:
@@ -180,20 +236,52 @@ class AsyncTTSPlayer:
         self.sample_rate = sample_rate_hz
         self.queue = queue.Queue()
         self.stop_event = threading.Event()
+        self.output_devices = select_output_devices()
+        self.stream_ok = True
         self.worker_thread = threading.Thread(target=self._worker, daemon=True)
         self.worker_thread.start()
 
+    def _device_samplerate(self, dev):
+        try:
+            info = sd.query_devices(dev)
+            rate = info.get("default_samplerate", None)
+            if rate:
+                return int(rate)
+        except Exception:
+            pass
+        return int(self.sample_rate)
+
+    def _resample_if_needed(self, audio_float, target_rate):
+        if int(target_rate) == int(self.sample_rate):
+            return audio_float
+        # Resample from voice sample rate to device sample rate.
+        return resample_poly(audio_float, target_rate, self.sample_rate).astype(np.float32)
+
     def _worker(self):
+        if not self.output_devices:
+            print("Uygun bir ses çıkış cihazı bulunamadı; TTS sessiz modda çalışacak.")
+            self.stream_ok = False
+
         padding_duration_ms = 300
         padding_samples = int(self.sample_rate * (padding_duration_ms / 1000))
 
-        stream = sd.OutputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="float32",
-            blocksize=0
-        )
-        stream.start()
+        streams = []
+        if self.stream_ok:
+            try:
+                for dev in self.output_devices:
+                    dev_rate = self._device_samplerate(dev)
+                    stream = sd.OutputStream(
+                        samplerate=dev_rate,
+                        channels=1,
+                        dtype="float32",
+                        blocksize=0,
+                        device=dev
+                    )
+                    stream.start()
+                    streams.append((stream, dev_rate))
+            except Exception as exc:
+                print(f"Ses çıkış akışı başlatılamadı: {exc}")
+                self.stream_ok = False
 
         while not self.stop_event.is_set():
             item = self.queue.get()
@@ -203,24 +291,42 @@ class AsyncTTSPlayer:
 
             text, done_event = item
             try:
-                for chunk in self.voice.synthesize(text):
-                    audio_float = chunk.audio_float_array.astype(np.float32)
-                    if audio_float.size > 0:
-                        stream.write(audio_float.reshape(-1, 1))
-                silence = np.zeros(padding_samples, dtype=np.float32)
-                if silence.size > 0:
-                    stream.write(silence.reshape(-1, 1))
+                if self.stream_ok and streams:
+                    for chunk in self.voice.synthesize(text):
+                        audio_float = chunk.audio_float_array.astype(np.float32)
+                        if audio_float.size > 0:
+                            for stream, dev_rate in streams:
+                                out = self._resample_if_needed(audio_float, dev_rate)
+                                payload = out.reshape(-1, 1)
+                                stream.write(payload)
+                    silence = np.zeros(padding_samples, dtype=np.float32)
+                    if silence.size > 0:
+                        for stream, dev_rate in streams:
+                            out = self._resample_if_needed(silence, dev_rate)
+                            pad = out.reshape(-1, 1)
+                            stream.write(pad)
             finally:
                 if done_event:
                     done_event.set()
                 self.queue.task_done()
 
-        stream.stop()
-        stream.close()
+        for stream, _ in streams:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def speak(self, text, blocking=False):
         cleaned = (text or "").strip()
         if not cleaned:
+            return
+        if not self.stream_ok:
+            if blocking:
+                return
             return
         done_event = threading.Event() if blocking else None
         self.queue.put((cleaned, done_event))
@@ -813,9 +919,23 @@ def main():
 
     load_qdrant_collection(client, face_db_path)
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Kamera açılamadı (cv2.VideoCapture). Doğru cihaza erişebildiğinden emin ol.")
+    picam2 = None
+    libcamera_path = "/usr/lib/python3/dist-packages"
+    if os.path.isdir(libcamera_path) and libcamera_path not in sys.path:
+        sys.path.append(libcamera_path)
+
+    try:
+        from picamera2 import Picamera2
+        picam2 = Picamera2()
+        picam2.configure(
+            picam2.create_preview_configuration(
+                main={"size": (EXPECTED_W, EXPECTED_H), "format": "BGR888"}
+            )
+        )
+        picam2.start()
+        print("Kamera dogrudan baslatildi (Picamera2).")
+    except Exception as exc:
+        print(f"Kamera baslatilamadi: {exc}")
         return
 
     watchdog_thread = threading.Thread(target=db_watchdog, daemon=True)
@@ -826,201 +946,211 @@ def main():
 
     print("Robot baslatildi - yuz bekleniyor...")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret or frame is None or not isinstance(frame, np.ndarray):
-            print("Kameradan kare alınamadı, döngü sonlandırılıyor...")
-            break
+    try:
+        while True:
+            frame = picam2.capture_array()
 
-        faces = face_app.get(frame)
+            # 🔧 RENK DÜZELTME (IMX708 / libcamera)
+            # libcamera pipeline pratikte RGB gibi geliyor
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            display_frame = frame.copy()
 
-        if faces:
-            faces.sort(key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
-            face_obj = faces[0]
-            embedding = get_embedding_from_face(face_obj)
-            if embedding is None:
-                continue
+            faces = face_app.get(frame)
 
-            x1, y1, x2, y2 = face_obj.bbox.astype(int)
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(frame.shape[1], x2)
-            y2 = min(frame.shape[0], y2)
-            w = x2 - x1
-            h = y2 - y1
+            if faces:
+                faces.sort(key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
+                face_obj = faces[0]
+                embedding = get_embedding_from_face(face_obj)
+                if embedding is None:
+                    continue
 
-            if current_state == RobotState.WAITING:
-                face_first_seen_time = time.time()
-                current_state = RobotState.ANALYZING
-                print("Yuz algilandi, analiz ediliyor...")
+                x1, y1, x2, y2 = face_obj.bbox.astype(int)
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(frame.shape[1], x2)
+                y2 = min(frame.shape[0], y2)
+                w = x2 - x1
+                h = y2 - y1
 
-            elif current_state == RobotState.ANALYZING:
-                if time.time() - face_first_seen_time >= face_stable_duration:
-                    current_embedding = embedding
+                if current_state == RobotState.WAITING:
+                    face_first_seen_time = time.time()
+                    current_state = RobotState.ANALYZING
+                    print("Yuz algilandi, analiz ediliyor...")
 
-                    user_id, name, score = identify_face(embedding)
-                    current_score = score
-
-                    if user_id is not None:
-                        current_user_name = name
-                        display_user_name = name
-                        current_state = RobotState.RECOGNIZED
-                        print(f"Kisi tanindi: {name} (Score: {score:.2f}) - State: RECOGNIZED")
-                    else:
-                        current_state = RobotState.ASKING_NAME
-                        print(f"Taninmayan kisi (Score: {score:.2f}) - Threshold: {threshold} - State: ASKING_NAME")
-
-            elif current_state == RobotState.ASKING_NAME:
-                current_time = time.time()
-                if current_time - last_score_update_time >= score_update_interval:
-                    detected_id, detected_name, score = identify_face(embedding)
-                    current_score = score
-                    last_score_update_time = current_time
-
-                    if detected_id is not None:
-                        print(f"ASKING_NAME sirasinda taninan kisi: {detected_name}")
-                        current_user_name = detected_name
-                        display_user_name = detected_name
+                elif current_state == RobotState.ANALYZING:
+                    if time.time() - face_first_seen_time >= face_stable_duration:
                         current_embedding = embedding
-                        current_session_id = None
-                        user_is_known = True
-                        current_state = RobotState.RECOGNIZED
 
-            elif current_state in [RobotState.CHATTING, RobotState.RECOGNIZED]:
-                current_time = time.time()
+                        user_id, name, score = identify_face(embedding)
+                        current_score = score
 
-                if face_last_seen_time is not None:
-                    time_since_last_seen = current_time - face_last_seen_time
-                    if time_since_last_seen > 0.5:
-                        print(f"Yuz {time_since_last_seen:.1f}s kayip - yeniden analiz")
-                        face_first_seen_time = time.time()
-                        previous_user_name = current_user_name
-                        previous_embedding = current_embedding
-                        current_state = RobotState.RE_ANALYZING
-                        continue
-
-                if current_time - last_score_update_time >= score_update_interval:
-                    detected_id, detected_name, score = identify_face(embedding)
-
-                    last_score_update_time = current_time
-                    current_score = score
-
-                    if detected_id is not None and detected_name != current_user_name:
-                        print(f"Kimlik degisti: {current_user_name} -> {detected_name} (Score: {score:.2f})")
-                        current_user_name = detected_name
-                        display_user_name = detected_name
-                        current_embedding = embedding
-                        current_session_id = None
-                        user_is_known = True
-                        current_state = RobotState.RECOGNIZED
-
-                    elif detected_id is None:
-                        # Skor düşük olsa da mevcut kullanıcıyı koru; tamamen kaybolursa logout tetiklenecek
-                        print(f"Yuz taninmiyor (dusen skor): {score:.2f} < {threshold}, mevcut kullanici korunuyor")
-                        face_last_seen_time = current_time
-                        current_embedding = embedding
-                        display_user_name = "Bilinmiyor"
-                        continue
-
-                    else:
-                        current_embedding = embedding
-                        display_user_name = current_user_name
-
-            elif current_state == RobotState.RE_ANALYZING:
-                if time.time() - face_first_seen_time >= re_analyze_duration:
-                    new_embedding = embedding
-                    detected_id, detected_name, score = identify_face(new_embedding)
-
-                    if detected_id is not None:
-                        if detected_name == previous_user_name:
-                            print(f"Dogrulama basarili: {previous_user_name} (Score: {score:.2f})")
-                            current_user_name = previous_user_name
-                            current_embedding = new_embedding
-                            current_score = score
-                            display_user_name = previous_user_name
-                            current_state = RobotState.CHATTING
+                        if user_id is not None:
+                            current_user_name = name
+                            display_user_name = name
+                            current_state = RobotState.RECOGNIZED
+                            print(f"Kisi tanindi: {name} (Score: {score:.2f}) - State: RECOGNIZED")
                         else:
-                            print(f"Baska kullaniciya gecildi: {previous_user_name} -> {detected_name} (Score: {score:.2f})")
+                            current_state = RobotState.ASKING_NAME
+                            print(f"Taninmayan kisi (Score: {score:.2f}) - Threshold: {threshold} - State: ASKING_NAME")
+
+                elif current_state == RobotState.ASKING_NAME:
+                    current_time = time.time()
+                    if current_time - last_score_update_time >= score_update_interval:
+                        detected_id, detected_name, score = identify_face(embedding)
+                        current_score = score
+                        last_score_update_time = current_time
+
+                        if detected_id is not None:
+                            print(f"ASKING_NAME sirasinda taninan kisi: {detected_name}")
                             current_user_name = detected_name
-                            current_embedding = new_embedding
-                            current_score = score
+                            display_user_name = detected_name
+                            current_embedding = embedding
                             current_session_id = None
                             user_is_known = True
-                            display_user_name = detected_name
                             current_state = RobotState.RECOGNIZED
-                    else:
-                        print(f"Kimlik dogrulanamadi, isim sorulacak (Score: {score:.2f})")
-                        current_user_name = None
-                        current_session_id = None
-                        user_is_known = False
-                        display_user_name = "Bilinmiyor"
-                        current_state = RobotState.ASKING_NAME
 
-            if current_state in [RobotState.RECOGNIZED, RobotState.CHATTING]:
-                color = (0, 255, 0)
-                name_for_label = display_user_name or current_user_name or "Bilinmiyor"
-                label = f"{name_for_label} ({current_score:.2f})" if current_score is not None else f"{name_for_label}"
+                elif current_state in [RobotState.CHATTING, RobotState.RECOGNIZED]:
+                    current_time = time.time()
 
-            elif current_state == RobotState.ASKING_NAME:
-                color = (0, 165, 255)
-                label = f"Bilinmiyor ({current_score:.2f})" if current_score is not None else "Bilinmiyor"
+                    if face_last_seen_time is not None:
+                        time_since_last_seen = current_time - face_last_seen_time
+                        if time_since_last_seen > 0.5:
+                            print(f"Yuz {time_since_last_seen:.1f}s kayip - yeniden analiz")
+                            face_first_seen_time = time.time()
+                            previous_user_name = current_user_name
+                            previous_embedding = current_embedding
+                            current_state = RobotState.RE_ANALYZING
+                            continue
 
-            elif current_state == RobotState.RE_ANALYZING:
-                color = (0, 255, 255)
-                label = "Yeniden Analiz..."
+                    if current_time - last_score_update_time >= score_update_interval:
+                        detected_id, detected_name, score = identify_face(embedding)
+
+                        last_score_update_time = current_time
+                        current_score = score
+
+                        if detected_id is not None and detected_name != current_user_name:
+                            print(f"Kimlik degisti: {current_user_name} -> {detected_name} (Score: {score:.2f})")
+                            current_user_name = detected_name
+                            display_user_name = detected_name
+                            current_embedding = embedding
+                            current_session_id = None
+                            user_is_known = True
+                            current_state = RobotState.RECOGNIZED
+
+                        elif detected_id is None:
+                            # Skor düşük olsa da mevcut kullanıcıyı koru; tamamen kaybolursa logout tetiklenecek
+                            print(f"Yuz taninmiyor (dusen skor): {score:.2f} < {threshold}, mevcut kullanici korunuyor")
+                            face_last_seen_time = current_time
+                            current_embedding = embedding
+                            display_user_name = "Bilinmiyor"
+                            continue
+
+                        else:
+                            current_embedding = embedding
+                            display_user_name = current_user_name
+
+                elif current_state == RobotState.RE_ANALYZING:
+                    if time.time() - face_first_seen_time >= re_analyze_duration:
+                        new_embedding = embedding
+                        detected_id, detected_name, score = identify_face(new_embedding)
+
+                        if detected_id is not None:
+                            if detected_name == previous_user_name:
+                                print(f"Dogrulama basarili: {previous_user_name} (Score: {score:.2f})")
+                                current_user_name = previous_user_name
+                                current_embedding = new_embedding
+                                current_score = score
+                                display_user_name = previous_user_name
+                                current_state = RobotState.CHATTING
+                            else:
+                                print(f"Baska kullaniciya gecildi: {previous_user_name} -> {detected_name} (Score: {score:.2f})")
+                                current_user_name = detected_name
+                                current_embedding = new_embedding
+                                current_score = score
+                                current_session_id = None
+                                user_is_known = True
+                                display_user_name = detected_name
+                                current_state = RobotState.RECOGNIZED
+                        else:
+                            print(f"Kimlik dogrulanamadi, isim sorulacak (Score: {score:.2f})")
+                            current_user_name = None
+                            current_session_id = None
+                            user_is_known = False
+                            display_user_name = "Bilinmiyor"
+                            current_state = RobotState.ASKING_NAME
+
+                if current_state in [RobotState.RECOGNIZED, RobotState.CHATTING]:
+                    color = (0, 255, 0)
+                    name_for_label = display_user_name or current_user_name or "Bilinmiyor"
+                    label = f"{name_for_label} ({current_score:.2f})" if current_score is not None else f"{name_for_label}"
+
+                elif current_state == RobotState.ASKING_NAME:
+                    color = (0, 165, 255)
+                    label = f"Bilinmiyor ({current_score:.2f})" if current_score is not None else "Bilinmiyor"
+
+                elif current_state == RobotState.RE_ANALYZING:
+                    color = (0, 255, 255)
+                    label = "Yeniden Analiz..."
+
+                else:
+                    color = (0, 255, 255)
+                    label = "Analiz..."
+
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(display_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+                face_last_seen_time = time.time()
 
             else:
-                color = (0, 255, 255)
-                label = "Analiz..."
+                if current_state in [RobotState.CHATTING, RobotState.ASKING_NAME, RobotState.RECOGNIZED, RobotState.RE_ANALYZING]:
+                    if face_last_seen_time is not None:
+                        elapsed = time.time() - face_last_seen_time
+                        remaining = logout_timeout - elapsed
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-            face_last_seen_time = time.time()
-
-        else:
-            if current_state in [RobotState.CHATTING, RobotState.ASKING_NAME, RobotState.RECOGNIZED, RobotState.RE_ANALYZING]:
-                if face_last_seen_time is not None:
-                    elapsed = time.time() - face_last_seen_time
-                    remaining = logout_timeout - elapsed
-
-                    if elapsed >= logout_timeout:
-                        print(f"LOGOUT: {current_user_name} - 4s boyunca yuz algilanmadi")
+                        if elapsed >= logout_timeout:
+                            print(f"LOGOUT: {current_user_name} - 4s boyunca yuz algilanmadi")
+                            current_state = RobotState.WAITING
+                            current_user_name = None
+                            display_user_name = None
+                            current_session_id = None
+                            current_embedding = None
+                            current_score = None
+                            face_first_seen_time = None
+                            face_last_seen_time = None
+                            user_is_known = False
+                            print("Bekleme moduna gecildi - Yeni kullanici bekleniyor...")
+                        else:
+                            cv2.putText(display_frame, f"Logout: {remaining:.1f}s", (10, 60),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                else:
+                    if current_state != RobotState.WAITING:
                         current_state = RobotState.WAITING
-                        current_user_name = None
-                        display_user_name = None
-                        current_session_id = None
-                        current_embedding = None
-                        current_score = None
                         face_first_seen_time = None
-                        face_last_seen_time = None
-                        user_is_known = False
-                        print("Bekleme moduna gecildi - Yeni kullanici bekleniyor...")
-                    else:
-                        cv2.putText(frame, f"Logout: {remaining:.1f}s", (10, 60),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            else:
-                if current_state != RobotState.WAITING:
-                    current_state = RobotState.WAITING
-                    face_first_seen_time = None
-                    display_user_name = None
-                    print("Bekleme moduna gecildi")
+                        display_user_name = None
+                        print("Bekleme moduna gecildi")
 
-        status_text = f"Durum: {current_state.value}"
-        if current_user_name and current_state in [RobotState.RECOGNIZED, RobotState.CHATTING]:
-            status_text += f" | {current_user_name}"
-        cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            status_text = f"Durum: {current_state.value}"
+            if current_user_name and current_state in [RobotState.RECOGNIZED, RobotState.CHATTING]:
+                status_text += f" | {current_user_name}"
+            cv2.putText(display_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        cv2.imshow("Robot - Yuz Tanima", frame)
+            cv2.imshow("Frame", display_frame)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    watchdog_running = False
-
-    cap.release()
-    cv2.destroyAllWindows()
-    tts_player.shutdown()
-    print("Robot durduruldu")
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    finally:
+        watchdog_running = False
+        if picam2 is not None:
+            try:
+                picam2.stop()
+            except Exception:
+                pass
+            try:
+                picam2.close()
+            except Exception:
+                pass
+        cv2.destroyAllWindows()
+        tts_player.shutdown()
+        print("Robot durduruldu")
 
 
 if __name__ == "__main__":

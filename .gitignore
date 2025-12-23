@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+models/
+faster-whisper-medium-int8/
+conversation_history.db
