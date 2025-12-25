@@ -31,6 +31,8 @@ import time
 import importlib.resources as importlib_resources
 import ctypes
 import struct
+import atexit
+import signal
 
 load_dotenv()
 
@@ -39,6 +41,41 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+PICAM2_INSTANCE = None
+
+def _safe_shutdown():
+    global PICAM2_INSTANCE, watchdog_running
+    watchdog_running = False
+    try:
+        if PICAM2_INSTANCE is not None:
+            try:
+                PICAM2_INSTANCE.stop()
+            except Exception:
+                pass
+            try:
+                PICAM2_INSTANCE.close()
+            except Exception:
+                pass
+            PICAM2_INSTANCE = None
+    except Exception:
+        pass
+    try:
+        tts_player.shutdown()
+    except Exception:
+        pass
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
+
+def _handle_signal(_signum, _frame):
+    _safe_shutdown()
+    raise SystemExit(0)
+
+atexit.register(_safe_shutdown)
+for _sig in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(_sig, _handle_signal)
 
 try:
     cv2.setNumThreads(1)
@@ -197,7 +234,24 @@ def _parse_output_device_targets(raw_targets, devices):
                 break
     return targets
 
-def select_output_devices():
+def _probe_output_device(dev, sample_rate):
+    try:
+        stream = sd.OutputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="float32",
+            blocksize=0,
+            device=dev,
+        )
+        stream.start()
+        stream.stop()
+        stream.close()
+        return True
+    except Exception as exc:
+        print(f"Cihaz test edilemedi (dev={dev}, sr={sample_rate}): {exc}")
+        return False
+
+def select_output_devices(sample_rate=None):
     """Çıkış cihazlarını seç: env ile öncelik ver, yoksa varsayılan/ilk uygun."""
     try:
         devices = sd.query_devices()
@@ -209,7 +263,13 @@ def select_output_devices():
     if raw_env:
         targets = _parse_output_device_targets(raw_env.split(","), devices)
         if targets:
-            return targets[:2]
+            probed = []
+            for dev in targets:
+                rate = sample_rate or int(sd.query_devices(dev).get("default_samplerate", 44100))
+                if _probe_output_device(dev, rate):
+                    probed.append(dev)
+            if probed:
+                return probed[:2]
 
     targets = []
     try:
@@ -226,6 +286,14 @@ def select_output_devices():
         if len(targets) >= 2:
             break
 
+    if sample_rate:
+        probed = []
+        for dev in targets:
+            rate = sample_rate or int(sd.query_devices(dev).get("default_samplerate", 44100))
+            if _probe_output_device(dev, rate):
+                probed.append(dev)
+        return probed
+
     return targets
 
 
@@ -236,7 +304,7 @@ class AsyncTTSPlayer:
         self.sample_rate = sample_rate_hz
         self.queue = queue.Queue()
         self.stop_event = threading.Event()
-        self.output_devices = select_output_devices()
+        self.output_devices = select_output_devices(self.sample_rate)
         self.stream_ok = True
         self.worker_thread = threading.Thread(target=self._worker, daemon=True)
         self.worker_thread.start()
@@ -927,6 +995,8 @@ def main():
     try:
         from picamera2 import Picamera2
         picam2 = Picamera2()
+        global PICAM2_INSTANCE
+        PICAM2_INSTANCE = picam2
         picam2.configure(
             picam2.create_preview_configuration(
                 main={"size": (EXPECTED_W, EXPECTED_H), "format": "BGR888"}
@@ -1138,18 +1208,7 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     finally:
-        watchdog_running = False
-        if picam2 is not None:
-            try:
-                picam2.stop()
-            except Exception:
-                pass
-            try:
-                picam2.close()
-            except Exception:
-                pass
-        cv2.destroyAllWindows()
-        tts_player.shutdown()
+        _safe_shutdown()
         print("Robot durduruldu")
 
 
