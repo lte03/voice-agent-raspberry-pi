@@ -92,6 +92,12 @@ last_turn = "user"
 tts_in_progress = False
 tts_state_lock = threading.Lock()
 pending_tts_replay = False
+tts_error_count = 0
+tts_error_window_start = 0.0
+tts_disabled_until = 0.0
+tts_error_lock = threading.Lock()
+name_prompt_cooldown = 3.0
+last_name_prompt_time = 0.0
 face_lost_time = None
 low_score_start_time = None
 low_score_duration = 1.0
@@ -173,11 +179,27 @@ class AsyncTTSPlayer:
         self.sample_rate = sample_rate_hz
         self.queue = queue.Queue()
         self.stop_event = threading.Event()
+        self.last_error_time = 0.0
+        self.error_cooldown_sec = 2.0
         self.worker_thread = threading.Thread(target=self._worker, daemon=True)
         self.worker_thread.start()
 
+    def _play_text(self, text, stream, padding_samples, token):
+        for chunk in self.voice.synthesize(text):
+            if not is_tts_allowed() or not is_token_valid(token):
+                return False
+            audio_float = chunk.audio_float_array.astype(np.float32)
+            if audio_float.size > 0:
+                stream.write(audio_float.reshape(-1, 1))
+        if not is_tts_allowed() or not is_token_valid(token):
+            return False
+        silence = np.zeros(padding_samples, dtype=np.float32)
+        if silence.size > 0:
+            stream.write(silence.reshape(-1, 1))
+        return True
+
     def _worker(self):
-        padding_duration_ms = 300
+        padding_duration_ms = 120
         padding_samples = int(self.sample_rate * (padding_duration_ms / 1000))
 
         stream = sd.OutputStream(
@@ -198,23 +220,28 @@ class AsyncTTSPlayer:
             try:
                 if not is_tts_allowed() or not is_token_valid(token):
                     continue
+                if time.time() - self.last_error_time < self.error_cooldown_sec:
+                    continue
                 try:
                     with tts_state_lock:
                         global tts_in_progress
                         tts_in_progress = True
-                    for chunk in self.voice.synthesize(text):
-                        if not is_tts_allowed() or not is_token_valid(token):
-                            break
-                        audio_float = chunk.audio_float_array.astype(np.float32)
-                        if audio_float.size > 0:
-                            stream.write(audio_float.reshape(-1, 1))
-                    if not is_tts_allowed() or not is_token_valid(token):
-                        continue
-                    silence = np.zeros(padding_samples, dtype=np.float32)
-                    if silence.size > 0:
-                        stream.write(silence.reshape(-1, 1))
+                    self._play_text(text, stream, padding_samples, token)
                 except Exception as synth_err:
-                    print(f"Piper TTS hatasi (atlanacak): {synth_err}")
+                    fallback = to_ascii_fallback(text)
+                    if fallback and fallback != text:
+                        try:
+                            self._play_text(fallback, stream, padding_samples, token)
+                        except Exception as fallback_err:
+                            print(f"Piper TTS hatasi (fallback atlandi): {fallback_err}")
+                            self.last_error_time = time.time()
+                            self.clear_queue()
+                            note_tts_error()
+                    else:
+                        print(f"Piper TTS hatasi (atlanacak): {synth_err}")
+                        self.last_error_time = time.time()
+                        self.clear_queue()
+                        note_tts_error()
                 finally:
                     with tts_state_lock:
                         tts_in_progress = False
@@ -227,7 +254,7 @@ class AsyncTTSPlayer:
         stream.close()
 
     def speak(self, text, blocking=False, token=None):
-        cleaned = (text or "").strip()
+        cleaned = sanitize_tts_text(text)
         if not cleaned:
             return
         if token is None:
@@ -310,8 +337,23 @@ def is_token_valid(token):
 def is_stt_allowed():
     return current_state in (RobotState.ASKING_NAME, RobotState.CHATTING)
 
+def is_tts_blocked():
+    return time.time() < tts_disabled_until
+
 def is_tts_allowed():
-    return current_state in (RobotState.ASKING_NAME, RobotState.CHATTING, RobotState.RECOGNIZED)
+    return current_state in (RobotState.ASKING_NAME, RobotState.CHATTING, RobotState.RECOGNIZED) and not is_tts_blocked()
+
+def note_tts_error():
+    global tts_error_count, tts_error_window_start, tts_disabled_until
+    with tts_error_lock:
+        now = time.time()
+        if now - tts_error_window_start > 30.0:
+            tts_error_window_start = now
+            tts_error_count = 0
+        tts_error_count += 1
+        if tts_error_count >= 3:
+            tts_disabled_until = now + 15.0
+            tts_error_count = 0
 
 def save_qdrant_collection(client, filename="face_db.pkl"):
     all_points = []
@@ -462,16 +504,57 @@ def db_watchdog():
 conv_db = ConversationDB()
 
 system_prompt = """
-Sen Türkçe konuşan bir kişisel asistansın.
+Sen etkileşim kuran Türkçe konuşan bir kişisel asistansın.
 
-Kullanıcıyla konuşurken:
-0. Conversation History den ismini biiliyorsan 2. kısma geç bilmiyorsan 1. adımı uygula.
-1. İsmini bilmiyorsan selam ver ve adını sor.
-2. Kullanıcı konuşarak yanıt verince, mesajından adını tespit et.
-3. Adı belirsizse nazikçe tekrar sor.
-4. Adı öğrenince, onu adıyla selamla ve nasıl yardımcı olabileceğini sor.
+TEMEL AMACIN:
+Kullanıcıya en hızlı, en doğru ve en faydalı şekilde yardımcı olmak.
+Kullanıcıyı yormaz, tekrar ettirmez, gereksiz konuşmazsın.
 
-Tüm konuşmaları Türkçe ve doğal bir üslupla sürdür ve her konuda yardımcı olmaya çalış.
+KULLANICI TANIMA VE DAVRANIŞ KURALLARI:
+
+0) Eğer kullanıcı yalnızca bir selam verirse ve tanımıyorsan:
+   (ör: "merhaba", "selam", "hey", "alo", "günaydın"):
+   - Kısa ve doğal bir selamla karşılık ver
+   - Ardından adını sor
+   - Tek cümleyi geçme
+
+0.1) Eğer kullanıcı tanınıyorsa ve yalnızca bir selam verirse:
+     - Kullanıcıyı adıyla kısa bir selamla karşıla
+     - Ardından nasıl yardımcı olabileceğini sor
+     - Tek cümle kullan
+
+1) Eğer kullanıcının ismi zaten biliniyorsa:
+   - İsmini tekrar sorma
+   - Kullanıcıyı adıyla selamla
+   - Doğrudan nasıl yardımcı olabileceğine geç
+
+2) Eğer kullanıcının ismi bilinmiyorsa:
+   - Kısa ve doğal bir selam ver
+   - Açık ve net şekilde adını sor
+   - İsim öğrenilmeden uzun sohbete girme
+
+3) Kullanıcı konuşarak cevap verdiğinde:
+   - Mesajdan yalnızca ismi çıkarmaya çalış
+   - Emin değilsen nazikçe tekrar sor
+   - Asla tahmin etme veya uydurma isim kullanma
+
+4) İsim öğrenildiğinde:
+   - Kullanıcıyı adıyla hitap ederek selamla
+   - Kısa bir hoş geldin mesajı ver
+   - Hemen yardımcı olmaya odaklan
+
+KONUŞMA TARZI:
+- Türkçe konuş
+- Doğal, sade ve samimi ol
+- Kısa ve net cümleler kur
+- Sesli sistem olduğunu unutma
+- Uzun açıklamalar yapma
+
+DAVRANIŞ PRENSİPLERİ:
+- Kullanıcıyı tanıyorsan tekrar tanışıyormuş gibi davranma
+- Kullanıcıyı bekletme
+- İhtiyacı anlamaya öncelik ver
+- Teknik detaya yalnızca istenirse gir
 """
 
 name_extraction_prompt = """
@@ -732,8 +815,30 @@ def sayilari_yaziya_cevir(text):
 
     return text
 
+def sanitize_tts_text(text, max_len=400):
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"(.)\1{3,}", r"\1\1", cleaned)
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip()
+    return cleaned
+
+def to_ascii_fallback(text):
+    if not text:
+        return ""
+    replacements = str.maketrans({
+        "ç": "c", "ğ": "g", "ı": "i", "ö": "o", "ş": "s", "ü": "u",
+        "Ç": "C", "Ğ": "G", "İ": "I", "Ö": "O", "Ş": "S", "Ü": "U",
+    })
+    safe = text.translate(replacements)
+    safe = re.sub(r"[^A-Za-z0-9\s\.\,\!\?\:\;\-\(\)\'\"/]", "", safe)
+    safe = re.sub(r"\s+", " ", safe).strip()
+    return safe
+
 def speech(text, blocking=False):
-    cleaned_text = (text or "").strip()
+    cleaned_text = sanitize_tts_text(text)
     if not cleaned_text:
         print("Ses için gönderilen metin boş, ses oluşturma atlandı.")
         return
@@ -782,6 +887,7 @@ def extract_name_from_response(user_text):
 def nlp_pipeline():
     global current_state, current_user_name, current_session_id, current_embedding, user_is_known
     global last_assistant_text, last_assistant_time, last_turn, pending_tts_replay
+    global last_name_prompt_time
     
     print("[NLP Thread] Başlatıldı")
     last_debug_state = None
@@ -794,20 +900,39 @@ def nlp_pipeline():
         if current_state == RobotState.ASKING_NAME:
             turn_token = get_interaction_token()
             last_turn = "assistant"
+
+            if is_tts_blocked():
+                time.sleep(0.5)
+                continue
+            if time.time() - last_name_prompt_time < name_prompt_cooldown:
+                time.sleep(0.2)
+                continue
+
             print("\nTanınmayan kişi - İsim soruluyor...")
-            
+
             greeting = get_openai_response("Merhaba", save_to_db=False)
             print(f"Bot: {greeting}")
             if is_token_valid(turn_token):
                 last_assistant_text = greeting
                 last_assistant_time = time.time()
+                last_name_prompt_time = last_assistant_time
                 speech(greeting.lower(), blocking=True)
             
             user_text = stt_worker.run_sync(on_segment=lambda seg: print(f"[STT partial] {seg}"))
             if not is_token_valid(turn_token):
                 continue
             print(f"Kullanıcı: {user_text}")
-            
+
+            if not user_text.strip():
+                retry_msg = "Seni duyamadim. Adini tekrar soyler misin?"
+                print(f"Bot: {retry_msg}")
+                if is_token_valid(turn_token):
+                    last_assistant_text = retry_msg
+                    last_assistant_time = time.time()
+                    last_name_prompt_time = last_assistant_time
+                    speech(retry_msg.lower(), blocking=True)
+                continue
+
             extracted_name = extract_name_from_response(user_text)
             
             if extracted_name:
@@ -1098,20 +1223,20 @@ def main():
                         pending_tts_replay = False
 
             if current_state in [RobotState.RECOGNIZED, RobotState.CHATTING]:
-                color = (0, 255, 0)
+                color = (80, 200, 120)
                 name_for_label = display_user_name or current_user_name or "Bilinmiyor"
                 label = f"{name_for_label} ({current_score:.2f})" if current_score is not None else f"{name_for_label}"
 
             elif current_state == RobotState.ASKING_NAME:
-                color = (0, 165, 255)
+                color = (255, 140, 0)
                 label = f"Bilinmiyor ({current_score:.2f})" if current_score is not None else "Bilinmiyor"
 
             elif current_state == RobotState.RE_ANALYZING:
-                color = (0, 255, 255)
+                color = (255, 105, 180)
                 label = "Yeniden Analiz..."
 
             else:
-                color = (0, 255, 255)
+                color = (0, 200, 255)
                 label = "Analiz..."
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
