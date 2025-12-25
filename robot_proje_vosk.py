@@ -3,12 +3,12 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import pyaudio
+from vosk import Model, KaldiRecognizer
 import simpleaudio as sa
 import threading
 import sounddevice as sd
 from insightface.app import FaceAnalysis
 from piper.voice import PiperVoice
-from vosk import Model, KaldiRecognizer
 from enum import Enum,auto
 import wave
 from qdrant_client import QdrantClient
@@ -93,6 +93,8 @@ tts_in_progress = False
 tts_state_lock = threading.Lock()
 pending_tts_replay = False
 face_lost_time = None
+low_score_start_time = None
+low_score_duration = 1.0
 
 # Logout zamanlayıcısı
 face_last_seen_time = None
@@ -112,15 +114,13 @@ VOSK_MODEL_PATH = os.getenv(
     "VOSK_MODEL_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "vosk-model-small-tr-0.3")
 )
-VOSK_SAMPLE_RATE = int(os.getenv("VOSK_SAMPLE_RATE", "16000"))
 CHUNK = 4096
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-RATE = VOSK_SAMPLE_RATE
+RATE = 16000
 temp_audio_file = "temp_recording.wav"
-# Dosya kaydetmeyi aç/kapat (debug için)
+# Dosya kaydetmeyi a‡/kapat (debug i‡in)
 ENABLE_DEBUG_AUDIO_SAVE = False
-STT_EMPTY_COOLDOWN = float(os.getenv("STT_EMPTY_COOLDOWN", "1.0"))
 
 threshold = 0.65
 face_db_path = "face_db.pkl"
@@ -133,18 +133,11 @@ MODEL_PATH = os.path.join(MODEL_DIR, "tr_TR-fahrettin-medium.onnx")
 face_app = FaceAnalysis(name="buffalo_s", providers=['CPUExecutionProvider'])
 face_app.prepare(ctx_id=-1, det_size=(320, 320))
 pyaudio_instance = pyaudio.PyAudio()
+VOSK_MODEL_PATH = get_short_path(VOSK_MODEL_PATH)
 if not os.path.isdir(VOSK_MODEL_PATH):
-    print(f"Vosk modeli bulunamadı: {VOSK_MODEL_PATH}")
+    print(f"Vosk modeli bulunamad? : {VOSK_MODEL_PATH}")
     exit(0)
-try:
-    vosk_model = Model(VOSK_MODEL_PATH)
-except Exception:
-    # Unicode path sorunlarına karşı kısa yol dene (ör. Masaüstü)
-    short_model_path = get_short_path(VOSK_MODEL_PATH)
-    if short_model_path != VOSK_MODEL_PATH and os.path.isdir(short_model_path):
-        vosk_model = Model(short_model_path)
-    else:
-        raise
+vosk_model = Model(VOSK_MODEL_PATH)
 
 global_id_counter = 0
 
@@ -274,9 +267,19 @@ class AsyncSTT:
     def start_job(self, duration=5, on_segment=None):
         result = {"text": ""}
         done_event = threading.Event()
+        job_token = get_interaction_token()
 
         def _worker():
-            result["text"] = record_and_transcribe(duration, on_segment=on_segment)
+            if not is_stt_allowed():
+                done_event.set()
+                return
+            result["text"] = record_and_transcribe(
+                duration,
+                on_segment=on_segment,
+                should_abort=lambda: job_token != get_interaction_token() or not is_stt_allowed()
+            )
+            if job_token != get_interaction_token() or not is_stt_allowed():
+                result["text"] = ""
             done_event.set()
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -666,12 +669,8 @@ def save_recording(audio_data):
 def transcribe_frames(frames, on_segment=None):
     try:
         recognizer = KaldiRecognizer(vosk_model, RATE)
-        recognizer.SetWords(False)
         collected_segments = []
-
         for frame in frames:
-            if not frame:
-                continue
             if recognizer.AcceptWaveform(frame):
                 result = json.loads(recognizer.Result())
                 text = (result.get("text") or "").strip()
@@ -681,30 +680,26 @@ def transcribe_frames(frames, on_segment=None):
                         try:
                             on_segment(text)
                         except Exception as cb_err:
-                            print(f"Partial segment callback hatasi: {cb_err}")
+                            print(f"Partial segment callback hatas? : {cb_err}")
             else:
                 if on_segment:
-                    try:
-                        partial = json.loads(recognizer.PartialResult()).get("partial", "").strip()
-                        if partial:
+                    partial = json.loads(recognizer.PartialResult()).get("partial", "").strip()
+                    if partial:
+                        try:
                             on_segment(partial)
-                    except Exception as cb_err:
-                        print(f"Partial segment callback hatasi: {cb_err}")
+                        except Exception as cb_err:
+                            print(f"Partial segment callback hatas? : {cb_err}")
 
         final_result = json.loads(recognizer.FinalResult())
         final_text = (final_result.get("text") or "").strip()
         if final_text:
             collected_segments.append(final_text)
-            if on_segment:
-                try:
-                    on_segment(final_text)
-                except Exception as cb_err:
-                    print(f"Partial segment callback hatasi: {cb_err}")
-
-        return " ".join(collected_segments).strip()
+        transcription = " ".join(collected_segments).strip()
+        return transcription
     except Exception as e:
-        print(f"Transkripsiyon hatası: {e}")
+        print(f"Transkripsiyon hatas? : {e}")
         return ""
+
 
 def sayilari_yaziya_cevir(text):
     def tarih_cevir(match):
@@ -797,16 +792,20 @@ def nlp_pipeline():
             last_debug_state = current_state
         
         if current_state == RobotState.ASKING_NAME:
+            turn_token = get_interaction_token()
             last_turn = "assistant"
             print("\nTanınmayan kişi - İsim soruluyor...")
             
             greeting = get_openai_response("Merhaba", save_to_db=False)
             print(f"Bot: {greeting}")
-            last_assistant_text = greeting
-            last_assistant_time = time.time()
-            speech(greeting.lower(), blocking=True)
+            if is_token_valid(turn_token):
+                last_assistant_text = greeting
+                last_assistant_time = time.time()
+                speech(greeting.lower(), blocking=True)
             
             user_text = stt_worker.run_sync(on_segment=lambda seg: print(f"[STT partial] {seg}"))
+            if not is_token_valid(turn_token):
+                continue
             print(f"Kullanıcı: {user_text}")
             
             extracted_name = extract_name_from_response(user_text)
@@ -830,20 +829,20 @@ def nlp_pipeline():
                 conv_db.add_message(current_user_name, current_session_id, "assistant", welcome)
                 
                 print(f"Bot: {welcome}")
-                last_assistant_text = welcome
-                last_assistant_time = time.time()
-                speech(welcome.lower(), blocking=True)
+                if is_token_valid(turn_token):
+                    last_assistant_text = welcome
+                    last_assistant_time = time.time()
+                    speech(welcome.lower(), blocking=True)
             else:
-                if not user_text.strip():
-                    time.sleep(STT_EMPTY_COOLDOWN)
-                    continue
                 retry_msg = get_openai_response(user_text, save_to_db=False)
                 print(f"Bot: {retry_msg}")
-                last_assistant_text = retry_msg
-                last_assistant_time = time.time()
-                speech(retry_msg.lower(), blocking=True)
+                if is_token_valid(turn_token):
+                    last_assistant_text = retry_msg
+                    last_assistant_time = time.time()
+                    speech(retry_msg.lower(), blocking=True)
                 
         elif current_state == RobotState.RECOGNIZED:
+            turn_token = get_interaction_token()
             last_turn = "assistant"
             print(f"\n[NLP] 👋 RECOGNIZED state yakalandı - {current_user_name} tanındı!")
             
@@ -861,11 +860,13 @@ def nlp_pipeline():
             
             greeting = get_openai_response(f"Merhaba, ben {current_user_name}", save_to_db=True)
             print(f"Bot: {greeting}")
-            last_assistant_text = greeting
-            last_assistant_time = time.time()
-            speech(greeting.lower(), blocking=True)
+            if is_token_valid(turn_token):
+                last_assistant_text = greeting
+                last_assistant_time = time.time()
+                speech(greeting.lower(), blocking=True)
             
         elif current_state == RobotState.CHATTING:
+            turn_token = get_interaction_token()
             # RE_ANALYZING durumundaysa bekle
             if current_state == RobotState.RE_ANALYZING:
                 time.sleep(0.1)
@@ -873,9 +874,24 @@ def nlp_pipeline():
             # Yeni kayda baslamadan once TTS kuyrugunun bosalmasini bekle
             tts_player.wait_until_idle()
 
+            if pending_tts_replay and is_tts_allowed():
+                if time.time() - last_assistant_time <= 1.0 and last_assistant_text:
+                    print("TTS yeniden baslatiliyor (kisa kayip).")
+                    pending_tts_replay = False
+                    speech(last_assistant_text.lower())
+                    tts_player.wait_until_idle()
+                else:
+                    pending_tts_replay = False
+
+            if not is_stt_allowed():
+                time.sleep(0.1)
+                continue
+
             last_turn = "user"
             print(f"Kayit basladi - Kullanici: {current_user_name}")
             user_text = stt_worker.run_sync(on_segment=lambda seg: print(f"[STT partial] {seg}"))
+            if not is_token_valid(turn_token):
+                continue
             
             if current_state == RobotState.RE_ANALYZING:
                 print("⏸️ Yeniden analiz yapılıyor, mesaj bekleniyor...")
@@ -886,12 +902,11 @@ def nlp_pipeline():
                 with llm_lock:
                     response = get_openai_response(user_text, save_to_db=True)
                     print(f"Bot: {response}")
-                    last_turn = "assistant"
-                    last_assistant_text = response
-                    last_assistant_time = time.time()
-                    speech(response.lower())
-            else:
-                time.sleep(STT_EMPTY_COOLDOWN)
+                    if is_token_valid(turn_token):
+                        last_turn = "assistant"
+                        last_assistant_text = response
+                        last_assistant_time = time.time()
+                        speech(response.lower())
         else:
             time.sleep(0.5)
 
@@ -899,12 +914,14 @@ def main():
     global current_state, current_user_name, current_session_id, current_embedding
     global face_first_seen_time, user_is_known, current_score, face_last_seen_time
     global watchdog_running, last_score_update_time, previous_user_name, previous_embedding, display_user_name
+    global pending_tts_replay, face_lost_time, low_score_start_time
 
     current_score = None
     last_score_update_time = 0
     previous_embedding = None
     previous_user_name = None
     display_user_name = None
+    low_score_start_time = None
 
     load_qdrant_collection(client, face_db_path)
 
@@ -1007,6 +1024,7 @@ def main():
                     current_score = score
 
                     if detected_id is not None and detected_name != current_user_name:
+                        low_score_start_time = None
                         print(f"Kimlik degisti: {current_user_name} -> {detected_name} (Score: {score:.2f})")
                         current_user_name = detected_name
                         display_user_name = detected_name
@@ -1016,14 +1034,30 @@ def main():
                         current_state = RobotState.RECOGNIZED
 
                     elif detected_id is None:
-                        # Skor düşük olsa da mevcut kullanıcıyı koru; tamamen kaybolursa logout tetiklenecek
-                        print(f"Yuz taninmiyor (dusen skor): {score:.2f} < {threshold}, mevcut kullanici korunuyor")
-                        face_last_seen_time = current_time
+                        if low_score_start_time is None:
+                            low_score_start_time = current_time
+                            print(f"Yuz taninmiyor (dusen skor): {score:.2f} < {threshold}")
+
+                        if current_time - low_score_start_time >= low_score_duration:
+                            print("Kimlik belirsizligi suruyor, isim sorulacak")
+                            current_user_name = None
+                            current_session_id = None
+                            user_is_known = False
+                            display_user_name = "Bilinmiyor"
+                            current_state = RobotState.ASKING_NAME
+                            face_first_seen_time = current_time
+                            bump_interaction_token()
+                            tts_player.clear_queue()
+                            pending_tts_replay = False
+                            low_score_start_time = None
+                        else:
+                            display_user_name = "Bilinmiyor"
+
                         current_embedding = embedding
-                        display_user_name = "Bilinmiyor"
                         continue
 
                     else:
+                        low_score_start_time = None
                         current_embedding = embedding
                         display_user_name = current_user_name
 
