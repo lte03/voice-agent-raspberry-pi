@@ -100,6 +100,9 @@ WHISPER_TEMPERATURE = float(os.getenv("WHISPER_TEMPERATURE", "0.0"))
 WHISPER_CONDITION_PREV = os.getenv("WHISPER_CONDITION_PREV", "false").lower() == "true"
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"
 WHISPER_CHUNK_LENGTH = int(os.getenv("WHISPER_CHUNK_LENGTH", "5"))
+STT_SILENCE_SECONDS = float(os.getenv("STT_SILENCE_SECONDS", "2.0"))
+STT_VAD_RMS = float(os.getenv("STT_VAD_RMS", "0.012"))
+STT_MIN_SPEECH_SECONDS = float(os.getenv("STT_MIN_SPEECH_SECONDS", "0.3"))
 CHUNK = 4096
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
@@ -110,8 +113,8 @@ processed_audio_file = "stt_final.wav"
 ENABLE_DEBUG_AUDIO_SAVE = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(BASE_DIR, "models", "tts_piper_fahrettin")
-MODEL_PATH = os.path.join(MODEL_DIR, "tr_TR-fahrettin-medium.onnx")
+MODEL_DIR = os.path.join(BASE_DIR, "models", "tts_piper_fettah")
+MODEL_PATH = os.path.join(MODEL_DIR, "tr_TR-fettah-medium.onnx")
 
 haar_cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
 face_cascade = cv2.CascadeClassifier(haar_cascade_path)
@@ -428,37 +431,7 @@ class AsyncTTSPlayer:
         self.worker_thread.join()
 
 
-class AsyncSTT:
-    """Kaydı ve transkripsiyonu arka planda çalıştırır, segment bazlı geri bildirim sağlar."""
-    def start_job(self, duration=5, on_segment=None):
-        result = {"text": ""}
-        done_event = threading.Event()
-        job_token = get_interaction_token()
-
-        def _worker():
-            if not is_stt_allowed():
-                done_event.set()
-                return
-            result["text"] = record_and_transcribe(
-                duration,
-                on_segment=on_segment,
-                should_abort=lambda: job_token != get_interaction_token() or not is_stt_allowed()
-            )
-            if job_token != get_interaction_token() or not is_stt_allowed():
-                result["text"] = ""
-            done_event.set()
-
-        threading.Thread(target=_worker, daemon=True).start()
-        return done_event, result
-
-    def run_sync(self, duration=5, on_segment=None):
-        done_event, result = self.start_job(duration=duration, on_segment=on_segment)
-        done_event.wait()
-        return result["text"]
-
-
 tts_player = AsyncTTSPlayer(voice, sample_rate)
-stt_worker = AsyncSTT()
 
 def bump_interaction_token():
     global interaction_token
@@ -505,7 +478,6 @@ system_prompt = """
 Sen etkileşim kuran Türkçe konuşan bir kişisel asistansın.
 SISTEM BILGISI:
 - Sesli bir sistemsin; STT (konusmadan yaziya) ve TTS (yazidan sese) kullanirsin.
-- Yuz tanima veya isim isteme yoktur.
 - Urun veritabani product_catalog.db dosyasidir (categories, products, suppliers).
 - Konusma gecmisi uygunsa sana verilir; son islemleri buna gore acikla.
 
@@ -541,7 +513,7 @@ def get_history_messages(limit=50):
     history = conv_db.get_all_history_for_user(current_user_name, limit)
     return [{"role": role, "content": content} for role, content in history]
 
-def get_openai_response(user_message, save_to_db=False, include_history=True):
+def get_openai_response(user_message, save_to_db=False, include_history=False):
     global current_user_name, current_session_id
     
     try:
@@ -625,13 +597,11 @@ db_tools = [
 ]
 
 def run_db_tool_router(user_text):
-    history_messages = get_history_messages(limit=12)
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4.1",
             messages=[
                 {"role": "system", "content": db_system_prompt},
-                *history_messages,
                 {"role": "user", "content": user_text}
             ],
             temperature=0,
@@ -684,7 +654,7 @@ def handle_user_message(user_text, save_to_db=False):
             f"{extra_hint}\n"
             "Bu sonuca gore kisa ve dogal bir yanit ver."
         )
-        response = get_openai_response(tool_prompt, save_to_db=False, include_history=True)
+        response = get_openai_response(tool_prompt, save_to_db=False, include_history=False)
         if save_to_db and current_session_id and current_user_name:
             conv_db.add_message(current_user_name, current_session_id, "user", user_text)
             conv_db.add_message(current_user_name, current_session_id, "assistant", response)
@@ -717,6 +687,48 @@ def record_and_transcribe(duration=5, on_segment=None, should_abort=None):
     if not frames:
         return ""
     return transcribe_frames(frames, on_segment=on_segment)
+
+def stream_listen_and_transcribe(
+    silence_seconds=2.0,
+    rms_threshold=0.012,
+    min_speech_seconds=0.3,
+    should_abort=None
+):
+    stream = pyaudio_instance.open(
+        format=FORMAT, channels=CHANNELS, rate=RATE,
+        input=True, frames_per_buffer=CHUNK
+    )
+    speech_frames = []
+    speech_started = False
+    silence_time = 0.0
+    speech_time = 0.0
+    chunk_seconds = CHUNK / float(RATE)
+
+    try:
+        while True:
+            if should_abort and should_abort():
+                break
+            data = stream.read(CHUNK, exception_on_overflow=False)
+            if not data:
+                continue
+            audio_i16 = np.frombuffer(data, dtype=np.int16)
+            rms = float(np.sqrt(np.mean((audio_i16.astype(np.float32) / 32768.0) ** 2)))
+            if rms >= rms_threshold:
+                speech_started = True
+                silence_time = 0.0
+                speech_time += chunk_seconds
+                speech_frames.append(data)
+            elif speech_started:
+                silence_time += chunk_seconds
+                if silence_time >= silence_seconds:
+                    break
+            # Bekleme durumunda gürültüyü yutmak için sessizlikte buffer ekleme
+        if not speech_started or speech_time < min_speech_seconds:
+            return ""
+        return transcribe_frames(speech_frames)
+    finally:
+        stream.stop_stream()
+        stream.close()
 
 def start_recording(duration=5, on_segment=None):
     """Geriye dönük uyumluluk: kaydı alır ve transkripsiyon yapar."""
@@ -922,8 +934,13 @@ def nlp_pipeline():
             continue
 
         last_turn = "user"
-        print("Kayit basladi")
-        user_text = stt_worker.run_sync(on_segment=lambda seg: print(f"[STT partial] {seg}"))
+        print("Kayit basladi (stream)")
+        user_text = stream_listen_and_transcribe(
+            silence_seconds=STT_SILENCE_SECONDS,
+            rms_threshold=STT_VAD_RMS,
+            min_speech_seconds=STT_MIN_SPEECH_SECONDS,
+            should_abort=lambda: not is_stt_allowed()
+        )
         if not is_token_valid(turn_token):
             continue
 
