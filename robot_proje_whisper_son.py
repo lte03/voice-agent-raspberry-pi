@@ -83,9 +83,6 @@ previous_user_name = None  # RE_ANALYZING sırasında önceki kullanıcıyı sak
 previous_embedding = None  # RE_ANALYZING sırasında önceki embedding'i sakla
 current_session_id = None
 current_embedding = None
-face_first_seen_time = None
-face_stable_duration = 2.0  
-re_analyze_duration = 0.5
 user_is_known = False
 display_user_name = None
 interaction_token = 0
@@ -100,20 +97,11 @@ tts_error_count = 0
 tts_error_window_start = 0.0
 tts_disabled_until = 0.0
 tts_error_lock = threading.Lock()
-name_prompt_cooldown = 3.0
-last_name_prompt_time = 0.0
 face_lost_time = None
-low_score_start_time = None
-low_score_duration = 1.0
 
 # Logout zamanlayıcısı
 face_last_seen_time = None
 logout_timeout = 4.0
-
-
-# Skor güncelleme aralığı
-score_update_interval = 0.5
-last_score_update_time = 0
 
 # Watchdog için
 db_check_interval = 2.0  
@@ -126,7 +114,7 @@ compute_type = "int8"
 
 WHISPER_MODEL_PATH = os.getenv(
     "WHISPER_MODEL_PATH",
-    r"./faster-whisper-medium-int8"
+    r"./faster-whisper-small"
 )
 WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "3"))
 WHISPER_NUM_WORKERS = int(os.getenv("WHISPER_NUM_WORKERS", "1"))
@@ -145,7 +133,7 @@ processed_audio_file = "stt_final.wav"
 # Dosya kaydetmeyi a‡/kapat (debug i‡in)
 ENABLE_DEBUG_AUDIO_SAVE = False
 
-threshold = 0.65
+threshold = 0.50
 face_db_path = "face_db.pkl"
 embedding_dim = 512
 
@@ -628,7 +616,7 @@ def reset_qdrant_collection():
 def force_logout():
     """Zorla logout yap - tüm durumu sıfırla"""
     global current_state, current_user_name, current_session_id, current_embedding
-    global face_first_seen_time, face_last_seen_time, user_is_known, display_user_name
+    global face_last_seen_time, user_is_known, display_user_name
     
     if current_user_name:
         print(f"\n🔴 ZORLA LOGOUT: {current_user_name}")
@@ -638,7 +626,6 @@ def force_logout():
     display_user_name = None
     current_session_id = None
     current_embedding = None
-    face_first_seen_time = None
     face_last_seen_time = None
     user_is_known = False
     bump_interaction_token()
@@ -689,6 +676,8 @@ def db_watchdog():
 conv_db = ConversationDB()
 PRODUCT_DB_PATH = "product_catalog.db"
 product_db = ProductDB(PRODUCT_DB_PATH)
+if not os.path.exists(PRODUCT_DB_PATH):
+    print("📦 product_catalog.db bulunamadi, ornek veri olusturuluyor...")
 product_db.seed_example_data()
 
 system_prompt = """
@@ -888,7 +877,7 @@ db_tools = [
         "type": "function",
         "function": {
             "name": "list_products",
-            "description": "Urunleri listele.",
+            "description": "Urunleri listele (fiyat ve stok dahil).",
             "parameters": {"type": "object", "properties": {}}
         }
     }
@@ -945,9 +934,13 @@ def handle_user_message(user_text, save_to_db=False):
         tool_name = tool_result.get("tool_name", "")
         tool_payload = tool_result.get("tool_result", {})
         tool_context = json.dumps(tool_payload, ensure_ascii=False)
+        extra_hint = ""
+        if tool_name == "list_products":
+            extra_hint = "Urunleri fiyat ve stok adetleriyle birlikte say."
         tool_prompt = (
             f"Kullanici istegi: {user_text}\n"
             f"DB arac sonucu ({tool_name}): {tool_context}\n"
+            f"{extra_hint}\n"
             "Bu sonuca gore kisa ve dogal bir yanit ver."
         )
         response = get_openai_response(tool_prompt, save_to_db=False, include_history=True)
@@ -969,57 +962,34 @@ def get_embedding_from_face(face_obj):
     return emb
 
 
-def cosine_similarity(emb1, emb2):
-    """İki embedding arasındaki cosine similarity hesapla"""
-    if emb1 is None or emb2 is None:
-        return 0.0
-    dot_product = np.dot(emb1, emb2)
-    norm1 = np.linalg.norm(emb1)
-    norm2 = np.linalg.norm(emb2)
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    return dot_product / (norm1 * norm2)
-
 def identify_face(embedding):
-    """Manuel cosine similarity ile yüz tanıma - Qdrant sadece depolama için kullanılıyor"""
-    all_points = []
-    next_page = None
-    
-    while True:
-        points, next_page = client.scroll(
-            collection_name=collection_name,
-            with_payload=True,
-            with_vectors=True,
-            limit=100,
-            offset=next_page
-        )
-        all_points.extend(points)
-        if next_page is None:
-            break
-    
-    if not all_points:
+    """Qdrant araması ile yüz tanıma (cosine score)"""
+    if embedding is None:
         return None, "Bilinmiyor", 0.0
-    
-    best_match_id = None
-    best_match_name = "Bilinmiyor"
-    best_similarity = 0.0
-    
-    for point in all_points:
-        stored_embedding = np.array(point.vector)
-        similarity = cosine_similarity(embedding, stored_embedding)
-        name = point.payload.get('name', 'Bilinmiyor')
-        
-        
-        if similarity > best_similarity:
-            best_similarity = similarity
-            best_match_id = point.id
-            best_match_name = name
-    
-    
-    if best_similarity >= threshold:
-        return best_match_id, best_match_name, best_similarity
-    
-    return None, "Bilinmiyor", best_similarity
+
+    try:
+        query = embedding.tolist() if isinstance(embedding, np.ndarray) else list(embedding)
+        results = client.search(
+            collection_name=collection_name,
+            query_vector=query,
+            limit=1,
+            with_payload=True
+        )
+    except Exception as exc:
+        print(f"Qdrant arama hatasi: {exc}")
+        return None, "Bilinmiyor", 0.0
+
+    if not results:
+        return None, "Bilinmiyor", 0.0
+
+    best = results[0]
+    score = float(best.score or 0.0)
+    name = best.payload.get("name", "Bilinmiyor")
+
+    if score >= threshold:
+        return best.id, name, score
+
+    return None, "Bilinmiyor", score
 
 def record_audio(duration=5, should_abort=None):
     stream = pyaudio_instance.open(
@@ -1246,7 +1216,6 @@ def extract_name_from_response(user_text):
 def nlp_pipeline():
     global current_state, current_user_name, current_session_id, current_embedding, user_is_known
     global last_assistant_text, last_assistant_time, last_turn, pending_tts_replay
-    global last_name_prompt_time
     
     print("[NLP Thread] Başlatıldı")
     last_debug_state = None
@@ -1263,10 +1232,6 @@ def nlp_pipeline():
             if is_tts_blocked():
                 time.sleep(0.5)
                 continue
-            if time.time() - last_name_prompt_time < name_prompt_cooldown:
-                time.sleep(0.2)
-                continue
-
             print("\nTanınmayan kişi - İsim soruluyor...")
 
             greeting = "Merhaba, adin nedir?"
@@ -1274,7 +1239,6 @@ def nlp_pipeline():
             if is_token_valid(turn_token):
                 last_assistant_text = greeting
                 last_assistant_time = time.time()
-                last_name_prompt_time = last_assistant_time
                 speech(greeting.lower(), blocking=True)
             
             user_text = stt_worker.run_sync(on_segment=lambda seg: print(f"[STT partial] {seg}"))
@@ -1288,7 +1252,6 @@ def nlp_pipeline():
                 if is_token_valid(turn_token):
                     last_assistant_text = retry_msg
                     last_assistant_time = time.time()
-                    last_name_prompt_time = last_assistant_time
                     speech(retry_msg.lower(), blocking=True)
                 continue
 
@@ -1396,16 +1359,14 @@ def nlp_pipeline():
 
 def main():
     global current_state, current_user_name, current_session_id, current_embedding
-    global face_first_seen_time, user_is_known, current_score, face_last_seen_time
-    global watchdog_running, last_score_update_time, previous_user_name, previous_embedding, display_user_name
-    global pending_tts_replay, face_lost_time, low_score_start_time
+    global user_is_known, current_score, face_last_seen_time
+    global watchdog_running, previous_user_name, previous_embedding, display_user_name
+    global pending_tts_replay, face_lost_time
 
     current_score = None
-    last_score_update_time = 0
     previous_embedding = None
     previous_user_name = None
     display_user_name = None
-    low_score_start_time = None
 
     load_qdrant_collection(client, face_db_path)
 
@@ -1461,41 +1422,38 @@ def main():
             h = y2 - y1
 
             if current_state == RobotState.WAITING:
-                face_first_seen_time = time.time()
                 current_state = RobotState.ANALYZING
                 print("Yuz algilandi, analiz ediliyor...")
 
             elif current_state == RobotState.ANALYZING:
-                if time.time() - face_first_seen_time >= face_stable_duration:
-                    current_embedding = embedding
+                current_embedding = embedding
+                user_id, name, score = identify_face(embedding)
+                current_score = score
 
-                    user_id, name, score = identify_face(embedding)
-                    current_score = score
-
-                    if user_id is not None:
-                        current_user_name = name
-                        display_user_name = name
-                        current_state = RobotState.RECOGNIZED
-                        print(f"Kisi tanindi: {name} (Score: {score:.2f}) - State: RECOGNIZED")
-                    else:
-                        current_state = RobotState.ASKING_NAME
-                        print(f"Taninmayan kisi (Score: {score:.2f}) - Threshold: {threshold} - State: ASKING_NAME")
+                if user_id is not None:
+                    current_user_name = name
+                    display_user_name = name
+                    current_state = RobotState.RECOGNIZED
+                    print(f"Kisi tanindi: {name} (Score: {score:.2f}) - State: RECOGNIZED")
+                else:
+                    current_state = RobotState.ASKING_NAME
+                    print(f"Taninmayan kisi (Score: {score:.2f}) - Threshold: {threshold} - State: ASKING_NAME")
 
             elif current_state == RobotState.ASKING_NAME:
-                current_time = time.time()
-                if current_time - last_score_update_time >= score_update_interval:
-                    detected_id, detected_name, score = identify_face(embedding)
-                    current_score = score
-                    last_score_update_time = current_time
+                detected_id, detected_name, score = identify_face(embedding)
+                current_score = score
 
-                    if detected_id is not None:
-                        print(f"ASKING_NAME sirasinda taninan kisi: {detected_name}")
-                        current_user_name = detected_name
-                        display_user_name = detected_name
-                        current_embedding = embedding
-                        current_session_id = None
-                        user_is_known = True
-                        current_state = RobotState.RECOGNIZED
+                if detected_id is not None:
+                    print(f"ASKING_NAME sirasinda taninan kisi: {detected_name}")
+                    bump_interaction_token()
+                    tts_player.clear_queue()
+                    pending_tts_replay = False
+                    current_user_name = detected_name
+                    display_user_name = detected_name
+                    current_embedding = embedding
+                    current_session_id = None
+                    user_is_known = True
+                    current_state = RobotState.RECOGNIZED
 
             elif current_state in [RobotState.CHATTING, RobotState.RECOGNIZED]:
                 current_time = time.time()
@@ -1505,7 +1463,6 @@ def main():
                     if time_since_last_seen > 1.0:
                         print(f"Yuz {time_since_last_seen:.1f}s kayip - yeniden analiz")
                         face_lost_time = current_time
-                        face_first_seen_time = time.time()
                         previous_user_name = current_user_name
                         previous_embedding = current_embedding
                         current_state = RobotState.RE_ANALYZING
@@ -1516,85 +1473,69 @@ def main():
                                 pending_tts_replay = True
                         continue
 
-                if current_time - last_score_update_time >= score_update_interval:
-                    detected_id, detected_name, score = identify_face(embedding)
+                detected_id, detected_name, score = identify_face(embedding)
+                current_score = score
 
-                    last_score_update_time = current_time
-                    current_score = score
+                if detected_id is not None and detected_name != current_user_name:
+                    print(f"Kimlik degisti: {current_user_name} -> {detected_name} (Score: {score:.2f})")
+                    current_user_name = detected_name
+                    display_user_name = detected_name
+                    current_embedding = embedding
+                    current_session_id = None
+                    user_is_known = True
+                    current_state = RobotState.RECOGNIZED
 
-                    if detected_id is not None and detected_name != current_user_name:
-                        low_score_start_time = None
-                        print(f"Kimlik degisti: {current_user_name} -> {detected_name} (Score: {score:.2f})")
-                        current_user_name = detected_name
-                        display_user_name = detected_name
-                        current_embedding = embedding
-                        current_session_id = None
-                        user_is_known = True
-                        current_state = RobotState.RECOGNIZED
+                elif detected_id is None:
+                    print(f"Yuz taninmiyor (Score: {score:.2f})")
+                    current_user_name = None
+                    current_session_id = None
+                    user_is_known = False
+                    display_user_name = "Bilinmiyor"
+                    current_state = RobotState.ASKING_NAME
+                    bump_interaction_token()
+                    tts_player.clear_queue()
+                    pending_tts_replay = False
+                    current_embedding = embedding
+                    continue
 
-                    elif detected_id is None:
-                        if low_score_start_time is None:
-                            low_score_start_time = current_time
-                            print(f"Yuz taninmiyor (dusen skor): {score:.2f} < {threshold}")
-
-                        if current_time - low_score_start_time >= low_score_duration:
-                            print("Kimlik belirsizligi suruyor, isim sorulacak")
-                            current_user_name = None
-                            current_session_id = None
-                            user_is_known = False
-                            display_user_name = "Bilinmiyor"
-                            current_state = RobotState.ASKING_NAME
-                            face_first_seen_time = current_time
-                            bump_interaction_token()
-                            tts_player.clear_queue()
-                            pending_tts_replay = False
-                            low_score_start_time = None
-                        else:
-                            display_user_name = "Bilinmiyor"
-
-                        current_embedding = embedding
-                        continue
-
-                    else:
-                        low_score_start_time = None
-                        current_embedding = embedding
-                        display_user_name = current_user_name
+                else:
+                    current_embedding = embedding
+                    display_user_name = current_user_name
 
             elif current_state == RobotState.RE_ANALYZING:
-                if time.time() - face_first_seen_time >= re_analyze_duration:
-                    new_embedding = embedding
-                    detected_id, detected_name, score = identify_face(new_embedding)
+                new_embedding = embedding
+                detected_id, detected_name, score = identify_face(new_embedding)
 
-                    if detected_id is not None:
-                        if detected_name == previous_user_name:
-                            print(f"Dogrulama basarili: {previous_user_name} (Score: {score:.2f})")
-                            current_user_name = previous_user_name
-                            current_embedding = new_embedding
-                            current_score = score
-                            display_user_name = previous_user_name
-                            current_state = RobotState.CHATTING
-                            if face_lost_time and time.time() - face_lost_time > 1.0:
-                                pending_tts_replay = False
-                        else:
-                            print(f"Baska kullaniciya gecildi: {previous_user_name} -> {detected_name} (Score: {score:.2f})")
-                            current_user_name = detected_name
-                            current_embedding = new_embedding
-                            current_score = score
-                            current_session_id = None
-                            user_is_known = True
-                            display_user_name = detected_name
-                            current_state = RobotState.RECOGNIZED
+                if detected_id is not None:
+                    if detected_name == previous_user_name:
+                        print(f"Dogrulama basarili: {previous_user_name} (Score: {score:.2f})")
+                        current_user_name = previous_user_name
+                        current_embedding = new_embedding
+                        current_score = score
+                        display_user_name = previous_user_name
+                        current_state = RobotState.CHATTING
+                        if face_lost_time and time.time() - face_lost_time > 1.0:
                             pending_tts_replay = False
                     else:
-                        print(f"Kimlik dogrulanamadi, isim sorulacak (Score: {score:.2f})")
-                        current_user_name = None
+                        print(f"Baska kullaniciya gecildi: {previous_user_name} -> {detected_name} (Score: {score:.2f})")
+                        current_user_name = detected_name
+                        current_embedding = new_embedding
+                        current_score = score
                         current_session_id = None
-                        user_is_known = False
-                        display_user_name = "Bilinmiyor"
-                        current_state = RobotState.ASKING_NAME
-                        bump_interaction_token()
-                        tts_player.clear_queue()
+                        user_is_known = True
+                        display_user_name = detected_name
+                        current_state = RobotState.RECOGNIZED
                         pending_tts_replay = False
+                else:
+                    print(f"Kimlik dogrulanamadi, isim sorulacak (Score: {score:.2f})")
+                    current_user_name = None
+                    current_session_id = None
+                    user_is_known = False
+                    display_user_name = "Bilinmiyor"
+                    current_state = RobotState.ASKING_NAME
+                    bump_interaction_token()
+                    tts_player.clear_queue()
+                    pending_tts_replay = False
 
             if current_state in [RobotState.RECOGNIZED, RobotState.CHATTING]:
                 color = (80, 200, 120)
@@ -1632,7 +1573,6 @@ def main():
                         current_session_id = None
                         current_embedding = None
                         current_score = None
-                        face_first_seen_time = None
                         face_last_seen_time = None
                         user_is_known = False
                         bump_interaction_token()
@@ -1643,7 +1583,6 @@ def main():
             else:
                 if current_state != RobotState.WAITING:
                     current_state = RobotState.WAITING
-                    face_first_seen_time = None
                     display_user_name = None
                     bump_interaction_token()
                     tts_player.clear_queue()
