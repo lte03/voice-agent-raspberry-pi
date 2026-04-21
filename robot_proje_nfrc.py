@@ -15,7 +15,7 @@ from num2words import num2words
 from dotenv import load_dotenv
 import queue
 import re
-import openai
+from market_llm.main import MarketAssistant
 import sqlite3
 import json
 from datetime import datetime
@@ -25,6 +25,10 @@ import time
 import importlib.resources as importlib_resources
 import ctypes
 import subprocess
+try:
+    import gpiod
+except Exception:
+    gpiod = None
 
 load_dotenv()
 
@@ -47,6 +51,101 @@ try:
     cv2.setNumThreads(1)
 except Exception:
     pass
+
+RED_PIN = 17
+BLUE_PIN = 22
+GREEN_PIN = 27
+GPIO_CHIP_NAME = "gpiochip0"
+GPIO_CONSUMER = "led_indicator"
+LED_ACTIVE_LOW = True
+
+
+class LedIndicator:
+    def __init__(self):
+        self.available = False
+        self.chip = None
+        self.red = None
+        self.blue = None
+        self.green = None
+        self._state = None
+        self._lock = threading.Lock()
+
+        if gpiod is None:
+            print("gpiod bulunamadi; LED gostergesi devre disi.")
+            return
+        try:
+            self.chip = gpiod.Chip(GPIO_CHIP_NAME)
+            self.red = self.chip.get_line(RED_PIN)
+            self.blue = self.chip.get_line(BLUE_PIN)
+            self.green = self.chip.get_line(GREEN_PIN)
+            default_off = 1 if LED_ACTIVE_LOW else 0
+            self.red.request(consumer=GPIO_CONSUMER, type=gpiod.LINE_REQ_DIR_OUT, default_vals=[default_off])
+            self.blue.request(consumer=GPIO_CONSUMER, type=gpiod.LINE_REQ_DIR_OUT, default_vals=[default_off])
+            self.green.request(consumer=GPIO_CONSUMER, type=gpiod.LINE_REQ_DIR_OUT, default_vals=[default_off])
+            self.available = True
+        except Exception as exc:
+            print(f"LED GPIO baslatilamadi: {exc}")
+            self.close()
+
+    def _write(self, line, on):
+        if line is None:
+            return
+        value = 0 if (on and LED_ACTIVE_LOW) else 1 if LED_ACTIVE_LOW else (1 if on else 0)
+        line.set_value(value)
+
+    def set_state(self, state):
+        if not self.available:
+            return
+        with self._lock:
+            if state == self._state:
+                return
+            red_on = green_on = blue_on = False
+            if state == "recording":
+                green_on = True
+            elif state == "thinking":
+                red_on = True
+            elif state == "speaking":
+                blue_on = True
+            elif state == "idle":
+                pass
+            else:
+                state = "idle"
+            self._write(self.red, red_on)
+            self._write(self.green, green_on)
+            self._write(self.blue, blue_on)
+            self._state = state
+
+    def close(self):
+        if not self.available:
+            return
+        with self._lock:
+            try:
+                self._write(self.red, False)
+                self._write(self.green, False)
+                self._write(self.blue, False)
+            except Exception:
+                pass
+            for line in (self.red, self.blue, self.green):
+                try:
+                    if line is not None:
+                        line.release()
+                except Exception:
+                    pass
+            try:
+                if self.chip is not None:
+                    self.chip.close()
+            except Exception:
+                pass
+            self.available = False
+            self._state = None
+
+
+led_indicator = LedIndicator()
+
+
+def set_led_state(state):
+    if led_indicator:
+        led_indicator.set_state(state)
 # Piper / espeak-ng data yolu: piper paketindeki espeak-ng-data dizinini kullan
 try:
     import piper
@@ -107,6 +206,7 @@ CHUNK = 4096
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
+TTS_MAX_CHARS = int(os.getenv("TTS_MAX_CHARS", "400"))
 temp_audio_file = "temp_recording.wav"
 processed_audio_file = "stt_final.wav"
 # Dosya kaydetmeyi a‡/kapat (debug i‡in)
@@ -132,9 +232,6 @@ whisper_model = WhisperModel(
     cpu_threads=WHISPER_CPU_THREADS,
     num_workers=WHISPER_NUM_WORKERS
 )
-
-openai.api_key = os.getenv("OPENAI_API_KEY")
-openai_client = openai.OpenAI()
 
 if not os.path.exists(MODEL_PATH):
     print(f"Piper model bulunamadı: {MODEL_PATH}")
@@ -355,6 +452,7 @@ class AsyncTTSPlayer:
                     with tts_state_lock:
                         global tts_in_progress
                         tts_in_progress = True
+                    set_led_state("speaking")
                     if self.stream_ok and streams:
                         self._play_text(text, streams, padding_samples, token)
                 except Exception as synth_err:
@@ -376,6 +474,7 @@ class AsyncTTSPlayer:
                 finally:
                     with tts_state_lock:
                         tts_in_progress = False
+                    set_led_state("idle")
             finally:
                 if done_event:
                     done_event.set()
@@ -473,6 +572,7 @@ product_db = ProductDB(PRODUCT_DB_PATH)
 if not os.path.exists(PRODUCT_DB_PATH):
     print("📦 product_catalog.db bulunamadi, ornek veri olusturuluyor...")
 product_db.seed_example_data()
+market_assistant = MarketAssistant()
 
 system_prompt = """
 Sen etkileşim kuran Türkçe konuşan bir kişisel asistansın.
@@ -500,13 +600,6 @@ DAVRANIŞ PRENSİPLERİ:
 - Teknik detaya yalnızca istenirse gir
 """
 
-db_system_prompt = """
-Kullanici urun/kategori/satis veritabani islemi istiyorsa uygun araci cagir.
-Silme gibi yikici islemler icin dogrudan arac cagir, onay isteme.
-Son yaptigi islem veya konusma gecmisi sorularinda arac cagrilmaz.
-Sohbet amacli mesajlarda arac cagrilmaz.
-"""
-
 def get_history_messages(limit=50):
     if not current_user_name:
         return []
@@ -515,25 +608,9 @@ def get_history_messages(limit=50):
 
 def get_openai_response(user_message, save_to_db=False, include_history=False):
     global current_user_name, current_session_id
-    
+
     try:
-        messages = [{"role": "system", "content": system_prompt}]
-        
-        if include_history and current_user_name:
-            history_messages = get_history_messages()
-            print(f"?? {current_user_name} icin {len(history_messages)} mesaj yuklendi")
-            messages.extend(history_messages)
-        
-        messages.append({"role": "user", "content": user_message})
-        
-        response = openai_client.chat.completions.create(
-            model="gpt-4.1",
-            messages=messages,
-            temperature=0.7,
-            max_tokens=500
-        )
-        
-        assistant_response = response.choices[0].message.content or ""
+        assistant_response = market_assistant.chat(user_message) or ""
 
         if not assistant_response.strip():
             assistant_response = "Su anda cevap olusturamadim, lutfen tekrarlar misin?"
@@ -545,121 +622,16 @@ def get_openai_response(user_message, save_to_db=False, include_history=False):
         return assistant_response
     
     except Exception as e:
-        print(f"OpenAI API Hatasi: {e}")
+        print(f"Market asistan hatasi: {e}")
         return "Uzgunum, su anda bir teknik sorun yasiyorum."
 
 
-db_tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_category",
-            "description": "Kategori silme istegi.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category_name": {"type": "string"}
-                },
-                "required": ["category_name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_product",
-            "description": "Urun silme istegi.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "product_name": {"type": "string"}
-                },
-                "required": ["product_name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_categories",
-            "description": "Kategorileri listele.",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_products",
-            "description": "Urunleri listele (fiyat ve stok dahil).",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    }
-]
-
-def run_db_tool_router(user_text):
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {"role": "system", "content": db_system_prompt},
-                {"role": "user", "content": user_text}
-            ],
-            temperature=0,
-            max_tokens=200,
-            tools=db_tools,
-            tool_choice="auto"
-        )
-    except Exception as e:
-        print(f"DB routing hatasi: {e}")
-        return {"handled": False, "response": None}
-
-    message = response.choices[0].message
-    tool_calls = message.tool_calls or []
-    if not tool_calls:
-        return {"handled": False, "response": None}
-
-    tool = tool_calls[0]
-    tool_name = tool.function.name
-    try:
-        args = json.loads(tool.function.arguments or "{}")
-    except json.JSONDecodeError:
-        args = {}
-
-    if tool_name == "delete_category":
-        result = product_db.delete_category_by_name(args.get("category_name", ""))
-        return {"handled": True, "tool_name": tool_name, "tool_result": result}
-    if tool_name == "delete_product":
-        result = product_db.delete_product_by_name(args.get("product_name", ""))
-        return {"handled": True, "tool_name": tool_name, "tool_result": result}
-    if tool_name == "list_categories":
-        result = product_db.list_categories()
-        return {"handled": True, "tool_name": tool_name, "tool_result": result}
-    if tool_name == "list_products":
-        result = product_db.list_products()
-        return {"handled": True, "tool_name": tool_name, "tool_result": result}
-    return {"handled": False, "response": None}
-
 def handle_user_message(user_text, save_to_db=False):
-    tool_result = run_db_tool_router(user_text)
-    if tool_result["handled"]:
-        tool_name = tool_result.get("tool_name", "")
-        tool_payload = tool_result.get("tool_result", {})
-        tool_context = json.dumps(tool_payload, ensure_ascii=False)
-        extra_hint = ""
-        if tool_name == "list_products":
-            extra_hint = "Urunleri fiyat ve stok adetleriyle birlikte say."
-        tool_prompt = (
-            f"Kullanici istegi: {user_text}\n"
-            f"DB arac sonucu ({tool_name}): {tool_context}\n"
-            f"{extra_hint}\n"
-            "Bu sonuca gore kisa ve dogal bir yanit ver."
-        )
-        response = get_openai_response(tool_prompt, save_to_db=False, include_history=False)
-        if save_to_db and current_session_id and current_user_name:
-            conv_db.add_message(current_user_name, current_session_id, "user", user_text)
-            conv_db.add_message(current_user_name, current_session_id, "assistant", response)
-        return response
-    return get_openai_response(user_text, save_to_db=save_to_db)
+    response = get_openai_response(user_text, save_to_db=False, include_history=False)
+    if save_to_db and current_session_id and current_user_name:
+        conv_db.add_message(current_user_name, current_session_id, "user", user_text)
+        conv_db.add_message(current_user_name, current_session_id, "assistant", response)
+    return response
 
 def record_audio(duration=5, should_abort=None):
     stream = pyaudio_instance.open(
@@ -694,6 +666,7 @@ def stream_listen_and_transcribe(
     min_speech_seconds=0.3,
     should_abort=None
 ):
+    set_led_state("recording")
     stream = pyaudio_instance.open(
         format=FORMAT, channels=CHANNELS, rate=RATE,
         input=True, frames_per_buffer=CHUNK
@@ -724,7 +697,9 @@ def stream_listen_and_transcribe(
                     break
             # Bekleme durumunda gürültüyü yutmak için sessizlikte buffer ekleme
         if not speech_started or speech_time < min_speech_seconds:
+            set_led_state("idle")
             return ""
+        set_led_state("thinking")
         return transcribe_frames(speech_frames)
     finally:
         stream.stop_stream()
@@ -747,6 +722,7 @@ def save_recording(audio_data):
         print(f"Ses dosyası kaydedilemedi: {e}")
 
 def transcribe_frames(frames, on_segment=None):
+    set_led_state("thinking")
     try:
         if not frames:
             return ""
@@ -801,6 +777,8 @@ def transcribe_frames(frames, on_segment=None):
     except Exception as e:
         print(f"Transkripsiyon hatas? : {e}")
         return ""
+    finally:
+        set_led_state("idle")
 
 
 def sayilari_yaziya_cevir(text):
@@ -834,13 +812,15 @@ def sayilari_yaziya_cevir(text):
 
     return text
 
-def sanitize_tts_text(text, max_len=400):
+def sanitize_tts_text(text, max_len=None):
     cleaned = (text or "").strip()
     if not cleaned:
         return ""
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"(.)\1{3,}", r"\1\1", cleaned)
-    if len(cleaned) > max_len:
+    if max_len is None:
+        max_len = TTS_MAX_CHARS
+    if max_len and len(cleaned) > max_len:
         cleaned = cleaned[:max_len].rstrip()
     return cleaned
 
@@ -878,17 +858,78 @@ def normalize_piper_text(text):
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
+def split_tts_text(text, max_len):
+    if not text:
+        return []
+    max_len = max_len if max_len and max_len > 0 else TTS_MAX_CHARS
+    if max_len <= 0:
+        return [text]
+
+    # Prefer natural breaks: newlines or sentence endings.
+    parts = re.split(r"(?:\n+|(?<=[.!?])\s+)", text)
+    chunks = []
+    current = []
+    current_len = 0
+
+    def flush_current():
+        nonlocal current, current_len
+        if current:
+            chunks.append(" ".join(current).strip())
+            current = []
+            current_len = 0
+
+    for part in parts:
+        piece = part.strip()
+        if not piece:
+            continue
+        if len(piece) > max_len:
+            # Split long piece by words to respect max length.
+            flush_current()
+            words = piece.split()
+            buf = []
+            buf_len = 0
+            for word in words:
+                wlen = len(word) + (1 if buf else 0)
+                if buf_len + wlen > max_len:
+                    if buf:
+                        chunks.append(" ".join(buf).strip())
+                    buf = [word]
+                    buf_len = len(word)
+                else:
+                    buf.append(word)
+                    buf_len += wlen
+            if buf:
+                chunks.append(" ".join(buf).strip())
+            continue
+
+        if current_len + (len(piece) + (1 if current else 0)) > max_len:
+            flush_current()
+        current.append(piece)
+        current_len += len(piece) + (1 if current_len else 0)
+
+    flush_current()
+    return chunks
+
 def speech(text, blocking=False):
-    cleaned_text = sanitize_tts_text(text)
-    if not cleaned_text:
+    if not text:
         print("Ses için gönderilen metin boş, ses oluşturma atlandı.")
         return
     if not is_tts_allowed():
         return
 
-    normalized_text = sayilari_yaziya_cevir(normalize_piper_text(cleaned_text))
+    chunks = split_tts_text(text, TTS_MAX_CHARS)
+    if not chunks:
+        print("Ses için gönderilen metin boş, ses oluşturma atlandı.")
+        return
+
     print("Ses kuyruğa alındı (asenkron TTS)...")
-    tts_player.speak(normalized_text, blocking=blocking, token=get_interaction_token())
+    token = get_interaction_token()
+    for chunk in chunks:
+        cleaned_text = sanitize_tts_text(chunk, max_len=TTS_MAX_CHARS)
+        if not cleaned_text:
+            continue
+        normalized_text = sayilari_yaziya_cevir(normalize_piper_text(cleaned_text))
+        tts_player.speak(normalized_text, blocking=blocking, token=token)
 
 llm_lock = threading.Lock()
 
@@ -935,6 +976,7 @@ def nlp_pipeline():
 
         last_turn = "user"
         print("Kayit basladi (stream)")
+        set_led_state("recording")
         user_text = stream_listen_and_transcribe(
             silence_seconds=STT_SILENCE_SECONDS,
             rms_threshold=STT_VAD_RMS,
@@ -942,18 +984,23 @@ def nlp_pipeline():
             should_abort=lambda: not is_stt_allowed()
         )
         if not is_token_valid(turn_token):
+            set_led_state("idle")
             continue
 
         if user_text.strip():
             print(f"Kullanıcı: {user_text}")
             with llm_lock:
+                set_led_state("thinking")
                 response = handle_user_message(user_text, save_to_db=True)
                 print(f"Bot: {response}")
                 if is_token_valid(turn_token):
                     last_turn = "assistant"
                     last_assistant_text = response
                     last_assistant_time = time.time()
+                    set_led_state("idle")
                     speech(response.lower())
+        else:
+            set_led_state("idle")
         time.sleep(0.05)
 
 def main():
@@ -970,7 +1017,7 @@ def main():
         picam2 = Picamera2()
         picam2.configure(
             picam2.create_preview_configuration(
-                main={"size": (640, 480), "format": "BGR888"}
+                main={"size": (800,600), "format": "BGR888"}
             )
         )
         picam2.start()
@@ -984,38 +1031,42 @@ def main():
 
     print("Robot baslatildi - yuz bekleniyor...")
 
-    while True:
-        frame = picam2.capture_array()
-        if frame is None or not isinstance(frame, np.ndarray):
-            print("Kameradan kare alınamadı, döngü sonlandırılıyor...")
-            break
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5
-        )
+    try:
+        while True:
+            frame = picam2.capture_array()
+            if frame is None or not isinstance(frame, np.ndarray):
+                print("Kameradan kare alınamadı, döngü sonlandırılıyor...")
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5
+            )
 
-        if len(faces) > 0:
-            x, y, w, h = faces[0]
-            x1 = max(0, x)
-            y1 = max(0, y)
-            x2 = min(frame.shape[1], x + w)
-            y2 = min(frame.shape[0], y + h)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 200, 120), 2)
-            cv2.putText(frame, "Yuz", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 200, 120), 2)
+            if len(faces) > 0:
+                x, y, w, h = faces[0]
+                x1 = max(0, x)
+                y1 = max(0, y)
+                x2 = min(frame.shape[1], x + w)
+                y2 = min(frame.shape[0], y + h)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 200, 120), 2)
+                cv2.putText(frame, "Yuz", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 200, 120), 2)
 
-        status_text = f"Durum: {current_state.value}"
-        cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        cv2.imshow("Robot - Yuz Tespiti", frame)
+            status_text = f"Durum: {current_state.value}"
+            cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            cv2.imshow("Robot - Yuz Tespiti", frame)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    except KeyboardInterrupt:
+        led_indicator.close()
 
     picam2.stop()
     cv2.destroyAllWindows()
     tts_player.shutdown()
+    led_indicator.close()
     print("Robot durduruldu")
 
 
